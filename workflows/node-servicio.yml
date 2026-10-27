@@ -1,0 +1,97 @@
+name: Plantilla CI servicio VetChain
+
+on:
+  workflow_call:
+    inputs:
+      servicio:
+        description: "Carpeta del microservicio (ej. auth-service). Usa . si el servicio está en la raíz del repo"
+        required: true
+        type: string
+      nombre-imagen:
+        description: "Nombre de la imagen Docker (ej. vetchain-auth-service)"
+        required: true
+        type: string
+      node-version:
+        description: "Versión de Node (auth-service necesita >= 22.18)"
+        required: false
+        type: string
+        default: "22.x"
+      comando-pruebas:
+        description: "Comando de pruebas a ejecutar desde la RAÍZ del repo (vacío = no ejecutar)"
+        required: false
+        type: string
+        default: ""
+    secrets:
+      DOCKERHUB_USERNAME:
+        required: false
+      DOCKERHUB_TOKEN:
+        required: false
+
+jobs:
+  build:
+    name: ${{ inputs.servicio }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      TIENE_CREDENCIALES: ${{ secrets.DOCKERHUB_TOKEN != '' }}
+      PUBLICAR: ${{ github.ref == 'refs/heads/main' && github.event_name == 'push' }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.servicio }}
+    steps:
+      - name: Descargar código de VetChain
+        uses: actions/checkout@v4
+
+      - name: Verificar que el servicio tiene Dockerfile y package-lock.json
+        run: |
+          test -f Dockerfile || { echo "::error::Falta Dockerfile en ${{ inputs.servicio }}"; exit 1; }
+          test -f package-lock.json || { echo "::error::Falta package-lock.json en ${{ inputs.servicio }}"; exit 1; }
+
+      - name: Instalar Node ${{ inputs.node-version }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ inputs.node-version }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.servicio }}/package-lock.json
+
+      - name: Instalar dependencias (npm ci)
+        run: npm ci
+
+      - name: Control de calidad - revisar sintaxis JS
+        run: |
+          find . \( -name "*.js" -o -name "*.mjs" \) \
+            -not -path "./node_modules/*" -not -path "./uploads/*" -print0 \
+            | xargs -0 -n1 node --check
+          echo "✅ Sintaxis OK en ${{ inputs.servicio }}"
+
+      - name: Pruebas del proyecto
+        if: inputs.comando-pruebas != ''
+        working-directory: .
+        run: ${{ inputs.comando-pruebas }}
+
+      - name: Construir imagen Docker
+        run: docker build -t ${{ inputs.nombre-imagen }}:${{ github.sha }} .
+
+      - name: Login a Docker Hub (con secretos)
+        if: env.TIENE_CREDENCIALES == 'true' && env.PUBLICAR == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Publicar imagen en Docker Hub
+        if: env.TIENE_CREDENCIALES == 'true' && env.PUBLICAR == 'true'
+        run: |
+          IMG=${{ secrets.DOCKERHUB_USERNAME }}/${{ inputs.nombre-imagen }}
+          docker tag ${{ inputs.nombre-imagen }}:${{ github.sha }} $IMG:latest
+          docker tag ${{ inputs.nombre-imagen }}:${{ github.sha }} $IMG:${{ github.sha }}
+          docker push $IMG:latest
+          docker push $IMG:${{ github.sha }}
+
+      - name: Resumen
+        if: always()
+        run: |
+          echo "### VetChain · ${{ inputs.servicio }}" >> $GITHUB_STEP_SUMMARY
+          echo "- Imagen: \`${{ inputs.nombre-imagen }}:${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Publicada: ${{ env.TIENE_CREDENCIALES == 'true' && env.PUBLICAR == 'true' }}" >> $GITHUB_STEP_SUMMARY
